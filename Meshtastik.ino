@@ -1,5 +1,5 @@
 // #include <Arduino.h>
-
+// Для открытого канала
 // // Настройка пинов UART для вашей управляющей ESP32
 // #define ESP_RX_PIN 16 
 // #define ESP_TX_PIN 17 
@@ -51,8 +51,8 @@
 #endif
 
 // Настройка пинов UART для ESP32
-#define ESP_RX_PIN 16 
-#define ESP_TX_PIN 17 
+#define ESP_RX_PIN 16 // К ноге 46 Heltek
+#define ESP_TX_PIN 17 // К ноге 45 Heltek и прописать в программе
 
 HardwareSerial EspSerial(2);
 
