@@ -126,7 +126,7 @@ void sendDirectMessage(const char* text, uint32_t targetId) {
 void loop() {
   loopCounter++;
   String result = "TEST: " + String(loopCounter);
-  // Отправка сообщения "TEST" лично для ноды c1e3b1c4
+  // Отправка сообщения "TEST" лично для ноды c1e3b1c4 //NGPROM1
   sendDirectMessage(result.c_str(), TARGET_NODE_ID);
   
   // Интервал 30 секунд для предотвращения спама в Mesh-сети
