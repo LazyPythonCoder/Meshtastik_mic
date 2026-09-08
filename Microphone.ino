@@ -1,8 +1,8 @@
 #include "driver/i2s_std.h"
 
-#define I2S_BK_IO      GPIO_NUM_41  // SCK / BCLK
-#define I2S_WS_IO      GPIO_NUM_42  // WS / LRCLK
-#define I2S_DO_IO      GPIO_NUM_40  // SD / DOUT
+#define I2S_BK_IO      GPIO_NUM_4  // SCK / BCLK
+#define I2S_WS_IO      GPIO_NUM_5  // WS / LRCLK
+#define I2S_DO_IO      GPIO_NUM_6  // SD / DOUT
 
 #define SAMPLE_RATE    16000        // Частота дискретизации (16 кГц)
 #define BUFFER_SIZE    512          // Размер буфера в сэмплах
