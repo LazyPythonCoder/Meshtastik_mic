@@ -10,6 +10,7 @@ from dash.dependencies import Input, Output
 import dash_leaflet as dl
 import meshtastic
 import meshtastic.serial_interface
+import winsound
 
 # ==========================================
 # 1. НАСТРОЙКА ДАННЫХ И КООРДИНАТ НОД
@@ -51,6 +52,7 @@ def on_receive_message(packet, interface):
                     with status_lock:
                         node_statuses[sender_id] = "ALARM"
                     print(f" СТАТУС ОБНОВЛЕН: {sender_id} -> ALARM")
+                    winsound.Beep(frequency=800, duration=500)
                 elif "CLEAR" in message_text:
                     with status_lock:
                         node_statuses[sender_id] = "CLEAR"
@@ -175,3 +177,4 @@ if __name__ == "__main__":
 
     # Новый актуальный метод:
     app.run(debug=False, port=8050)
+
