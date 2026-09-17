@@ -1,127 +1,177 @@
+# "904026dd": {"name": "Нода 1", "lat": 55.592860, "lon": 37.612396, "status": "CLEAR"},
+# "a7eef537": {"name": "Нода 2", "lat": 55.593166, "lon": 37.614498, "status": "CLEAR"}
+
+
 import threading
-import json
-from flask import Flask, jsonify
-import folium
-from pubsub import pub
+import time
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output
+import dash_leaflet as dl
 import meshtastic
 import meshtastic.serial_interface
 
-app = Flask(__name__)
+# ==========================================
+# 1. НАСТРОЙКА ДАННЫХ И КООРДИНАТ НОД
+# ==========================================
 
-# Известные координаты нод
-NODE_COORDINATES = {
-    "904026dd": [55.592860, 37.612396]
+# Ваш словарь с фиксированными координатами нод.
+# Ключ (ID ноды) должен совпадать с тем, как нода идентифицирует себя в сети Meshtastic (например, её Node ID или имя)
+NODES_DATABASE = {
+    "!904026dd": {"name": "Нода-Перевал", "lat": 55.7558, "lon": 37.6173},
+    "!a7eef537": {"name": "Нода-Долина", "lat": 55.7517, "lon": 37.6011},
+    "Node_Three": {"name": "Нода-Лес", "lat": 55.7600, "lon": 37.6300},
 }
 
-# Текущие статусы нод (по умолчанию зеленый)
-node_statuses = {
-    "904026dd": "green"
-}
+# Глобальный словарь для хранения текущего статуса безопасности (по умолчанию все CLEAR)
+# Структура: { node_id: "CLEAR" или "ALARM" }
+node_statuses = {node_id: "CLEAR" for node_id in NODES_DATABASE}
+
+# Потокобезопасный лок для одновременного доступа из Meshtastic и Dash
+status_lock = threading.Lock()
 
 
-# 1. Функция обработки входящих сообщений от Meshtastic
-def on_receive_packet(packet, interface):
+# ==========================================
+# 2. ОБРАБОТКА ДАННЫХ ИЗ MESHTASTIC (USB)
+# ==========================================
+
+def on_receive_message(packet, interface):
+    """Callback-функция, которая срабатывает при получении любого пакета."""
     try:
-        if 'decoded' in packet and packet['decoded'].get('portnum') == 'TEXT_MESSAGE_APP':
-            from_id_raw = packet.get('fromId', '')
-            node_id = from_id_raw.replace('!', '').lower()
+        # Проверяем, что в пакете есть текстовое сообщение (portnum == TEXT_MESSAGE_APP)
+        if packet.get("decoded", {}).get("portnum") == "TEXT_MESSAGE_APP":
+            sender_id = packet.get("fromId")  # ID отправителя (например, '!248a3c10')
+            message_text = packet["decoded"]["text"].strip().upper()
 
-            if node_id in NODE_COORDINATES:
-                message = packet['decoded']['payload'].decode('utf-8').strip()
-                print(f"Получено сообщение от {node_id}: {message}")
+            print(f"[Meshtastic] Получено сообщение от {sender_id}: {message_text}")
 
-                if message == "ALARM":
-                    node_statuses[node_id] = "red"
-                elif message == "CLEAR":
-                    node_statuses[node_id] = "green"
+            # Если нода есть в нашей базе данных, обрабатываем её статус
+            if sender_id in node_statuses:
+                if "ALARM" in message_text:
+                    with status_lock:
+                        node_statuses[sender_id] = "ALARM"
+                    print(f" СТАТУС ОБНОВЛЕН: {sender_id} -> ALARM")
+                elif "CLEAR" in message_text:
+                    with status_lock:
+                        node_statuses[sender_id] = "CLEAR"
+                    print(f" СТАТУС ОБНОВЛЕН: {sender_id} -> CLEAR")
+
     except Exception as e:
-        print(f"Ошибка при обработке пакета: {e}")
+        print(f"Ошибка при разборе пакета: {e}")
 
 
-# 2. Инициализация Meshtastic в отдельном потоке
 def start_meshtastic():
-    print("Подключение к ноде Meshtastic через USB...")
+    """Инициализация USB-подключения к базовой ноде."""
+    print("Подключение к Meshtastic ноде через USB...")
     try:
-        pub.subscribe(on_receive_packet, "meshtastic.receive")
-        # Автоматически находит подключенную по USB ноду
+        # Автоматически находит подключенную по USB ноду.
+        # Если портов несколько, можно указать явно, например: devPath='/dev/ttyUSB0' или 'COM3'
         interface = meshtastic.serial_interface.SerialInterface()
+
+        # Подписываемся на событие получения текстовых сообщений
+        from pubsub import pub
+        pub.subscribe(on_receive_message, "meshtastic.receive.text")
+
+        print("Интерфейс Meshtastic успешно запущен и слушает эфир.")
     except Exception as e:
-        print(f"Не удалось подключиться к USB-ноде: {e}. Работа в демо-режиме.")
+        print(f"Не удалось подключиться к USB-ноде: {e}")
+        print("Программа продолжит работу в режиме симуляции карты.")
 
 
-# 3. Маршрут для получения статуса (API для фронтенда)
-@app.route('/api/status')
-def get_status():
-    return jsonify(node_statuses)
+# ==========================================
+# 3. ИНТЕРАКТИВНАЯ КАРТА (DASH & LEAFLET)
+# ==========================================
 
+app = dash.Dash(__name__)
 
-# 4. Главная страница с картой
-@app.route('/')
-def index():
-    start_coords = NODE_COORDINATES["904026dd"]
+# Стили для кастомных круглых маркеров (вместо стандартных синих капель)
+alarm_marker_style = {
+    "background-color": "red",
+    "border-radius": "50%",
+    "border": "2px solid white",
+    "width": "20px",
+    "height": "20px"
+}
 
-    # Создаем карту Folium
-    m = folium.Map(location=start_coords, zoom_start=14)
+clear_marker_style = {
+    "background-color": "green",
+    "border-radius": "50%",
+    "border": "2px solid white",
+    "width": "20px",
+    "height": "20px"
+}
 
-    # Создаем маркер средствами Folium. Он сразу будет на карте при загрузке.
-    # Добавляем кастомный класс 'node-marker-904026dd', чтобы легко найти его через JS.
-    marker = folium.Marker(
-        location=start_coords,
-        popup="<b>Нода:</b> 904026dd",
-        icon=folium.Icon(color=node_statuses["904026dd"], icon="info-sign")
+# Макет страницы
+app.layout = html.Div([
+    html.H1("Мониторинг безопасности нод Meshtastic", style={"textAlign": "center", "fontFamily": "Arial"}),
+
+    # Компонент карты
+    dl.Map(
+        id="map",
+        center=[55.7558, 37.6173],  # Центрирование (по умолчанию Москва)
+        zoom=13,
+        children=[
+            dl.TileLayer(),  # Базовый слой карты (OpenStreetMap)
+            html.Div(id="markers-layer")  # Динамический слой, куда мы будем рендерить маркеры
+        ],
+        style={'width': '100%', 'height': '80vh'}
+    ),
+
+    # Интервал обновления карты в миллисекундах (2000 мс = 2 секунды)
+    dcc.Interval(
+        id='interval-component',
+        interval=2000,
+        n_intervals=0
     )
-    marker.add_to(m)
-
-    # Кастомный JS, который находит существующий маркер по его HTML-классу
-    # и меняет иконку (AwesomeMarkers) на лету без перезагрузки всей карты.
-    custom_js = """
-    <script>
-    document.addEventListener("DOMContentLoaded", function() {
-        // Карта Folium генерирует маркеры с классами. Мы найдем ID внутреннего Leaflet-объекта маркера.
-        setTimeout(function() {
-            // Функция опроса статуса
-            function updateMarkers() {
-                fetch('/api/status')
-                    .then(response => response.json())
-                    .then(statuses => {
-                        for (var node_id in statuses) {
-                            var color = statuses[node_id]; // "red" или "green"
-
-                            // Находим элемент маркера на карте по уникальному стилю или классу Leaflet
-                            // Folium по умолчанию оборачивает маркеры в стандартные иконки Leaflet
-                            // Проще всего найти элемент с кластом awesome-marker-icon-ЦВЕТ и обновить его класс
-                            var markerElements = document.querySelectorAll('.awesome-marker-icon-green, .awesome-marker-icon-red');
-
-                            markerElements.forEach(function(el) {
-                                // Если статус изменился, подменяем CSS-классы иконки, чтобы поменять цвет
-                                if (color === 'red' && el.classList.contains('awesome-marker-icon-green')) {
-                                    el.classList.remove('awesome-marker-icon-green');
-                                    el.classList.add('awesome-marker-icon-red');
-                                } else if (color === 'green' && el.classList.contains('awesome-marker-icon-red')) {
-                                    el.classList.remove('awesome-marker-icon-red');
-                                    el.classList.add('awesome-marker-icon-green');
-                                }
-                            });
-                        }
-                    })
-                    .catch(err => console.error("Ошибка обновления статуса:", err));
-            }
-
-            // Запускаем интервал опроса каждые 2 секунды
-            setInterval(updateMarkers, 2000);
-        }, 1000);
-    });
-    </script>
-    """
-
-    # Внедряем скрипт в карту
-    m.get_root().html.add_child(folium.Element(custom_js))
-
-    return m.get_root().render()
+])
 
 
-if __name__ == '__main__':
-    mesh_thread = threading.Thread(target=start_meshtastic, daemon=True)
-    mesh_thread.start()
+@app.callback(
+    Output("markers-layer", "children"),
+    Input("interval-component", "n_intervals")
+)
+def update_markers(n):
+    """Каждые 2 секунды забирает актуальные статусы и перерисовывает круглые маркеры."""
+    markers = []
 
-    app.run(debug=True, use_reloader=False)
+    with status_lock:
+        current_statuses = node_statuses.copy()
+
+    for node_id, info in NODES_DATABASE.items():
+        status = current_statuses.get(node_id, "CLEAR")
+
+        # Определяем цвет в зависимости от статуса
+        color_node = "red" if status == "ALARM" else "green"
+
+        # Используем CircleMarker вместо DivMarker
+        marker = dl.CircleMarker(
+            center=[info["lat"], info["lon"]],
+            radius=10,  # Размер точки
+            color="white",  # Цвет обводки круга
+            weight=2,  # Толщина обводки в пикселях
+            fillColor=color_node,  # Внутренний цвет (Красный или Зеленый)
+            fillOpacity=0.9,  # Прозрачность заливки
+            children=[
+                dl.Popup([
+                    html.B(info["name"]),
+                    html.Br(),
+                    html.Span(f"ID: {node_id}"),
+                    html.Br(),
+                    html.Span(f"Статус: {status}", style={"color": color_node, "fontWeight": "bold"})
+                ])
+            ]
+        )
+        markers.append(marker)
+
+    return markers
+
+# ==========================================
+# 4. ЗАПУСК ПРИЛОЖЕНИЯ
+# ==========================================
+
+if __name__ == "__main__":
+    meshtastic_thread = threading.Thread(target=start_meshtastic, daemon=True)
+    meshtastic_thread.start()
+
+    # Новый актуальный метод:
+    app.run(debug=False, port=8050)
