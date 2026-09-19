@@ -11,18 +11,18 @@
 #define FFT_SIZE        1024
 #define BIN_RESOLUTION  ((float)SAMPLE_RATE / FFT_SIZE) 
 
-#define F0_MIN_HZ       180.0f
+#define F0_MIN_HZ       220.0f  
 #define F0_MAX_HZ       700.0f  
 #define F0_STEP_HZ      5.0f   
 
-// Пороги чувствительности оптимизированы под слабую 3-ю гармонику
-#define SNR_THRESHOLD   4.5f    
+// Оптимизированные пороги под тихий прерывистый дрон
+#define SNR_THRESHOLD   3.2f    // Ловит f0:3.6 и f1:2.6 из вашего лога
 #define NOISE_ALPHA     0.02f   
 #define MIN_NOISE_FLOOR 0.0003f 
 
-// Интеграционный гистерезис: мягкий накопитель баллов
-#define ALARM_SCORE_MAX   12    
-#define ALARM_SCORE_THRES 4     // Нужно набрать всего 4 балла (2 удачных кадра) для ALARM
+// Гистерезис
+#define ALARM_SCORE_MAX   10    
+#define ALARM_SCORE_THRES 4     // Срабатывание от 2-х кадров
 
 int32_t i2s_raw_buffer[FFT_SIZE];
 __attribute__((aligned(16))) float fft_input[FFT_SIZE * 2];
@@ -32,7 +32,8 @@ float noise_floor[FFT_SIZE / 2];
 
 bool is_alarm = false;
 int alarm_score = 0; 
-float tracked_f0 = 0.0f; // Сопровождаемая частота БПЛА
+float tracked_f0 = 0.0f; 
+int track_lifetime = 0; // Глобальный таймер удержания частоты
 
 float goertzel_magnitude(int32_t* num_array, int samples_count, float target_freq, float sampling_rate) {
     float k = 0.5f + ((float)samples_count * target_freq) / sampling_rate;
@@ -42,14 +43,12 @@ float goertzel_magnitude(int32_t* num_array, int samples_count, float target_fre
     float coeff = 2.0f * cosine;
 
     float q0 = 0, q1 = 0, q2 = 0;
-
     for (int i = 0; i < samples_count; i++) {
         float sample = (float)(num_array[i] >> 8) / 8388608.0f; 
         q0 = coeff * q1 - q2 + sample;
         q2 = q1;
         q1 = q0;
     }
-
     float power = (q1 * q1 + q2 * q2 - q1 * q2 * coeff);
     return sqrtf(power) * (2.0f / (float)samples_count);
 }
@@ -75,14 +74,12 @@ void init_i2s() {
         .tx_desc_auto_clear = false,
         .fixed_mclk = 0
     };
-
     i2s_pin_config_t pin_config = {
         .bck_io_num = I2S_BCLK_PIN,
         .ws_io_num = I2S_WS_PIN,
         .data_out_num = I2S_PIN_NO_CHANGE,
         .data_in_num = I2S_DATA_PIN
     };
-
     i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
     i2s_set_pin(I2S_PORT, &pin_config);
     i2s_zero_dma_buffer(I2S_PORT);
@@ -91,7 +88,7 @@ void init_i2s() {
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("[INIT] BATEAR Final Rock-Solid UAV Detector Starting...");
+    Serial.println("[INIT] BATEAR Memory-Fix UAV Detector Starting...");
 
     if (dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE) != ESP_OK) {
         Serial.println("[ERROR] DSP FFT Init Failed");
@@ -103,7 +100,7 @@ void setup() {
     for (int i = 0; i < FFT_SIZE / 2; i++) {
         noise_floor[i] = MIN_NOISE_FLOOR; 
     }
-    Serial.println("[INIT] Tracking system initialized.");
+    Serial.println("[INIT] System Ready. Leaky bucket tracking active.");
 }
 
 void loop() {
@@ -141,7 +138,7 @@ void loop() {
     }
     current_avg_noise /= 28.0f;
 
-    // 2. Валидация гармоник Герцелем + Фильтр спектральной чистоты
+    // 2. Валидация гармоник Герцелем
     bool drone_detected_this_frame = false;
     float best_f0 = 0.0f;
     float max_total_snr = 0.0f;
@@ -174,26 +171,22 @@ void loop() {
         float snr_f2  = amp_f2 / noise_f2;
         float snr_mid = amp_mid / noise_mid;
 
-        // Порог детекции адаптивен к общему шуму ветра
-        float base_threshold = (f0 < 280.0f) ? 5.8f : 3.4f;
-        float current_threshold = (current_avg_noise > 0.00045f) ? (base_threshold + 2.5f) : base_threshold;
+        float current_threshold = (current_avg_noise > 0.00045f) ? (SNR_THRESHOLD + 2.5f) : SNR_THRESHOLD;
 
-        // Метрика чистоты пика (Анти-Ветер)
+        // Фильтр спектральной чистоты (Анти-Ветер)
         if (amp_f0_left > (amp_f0 * 0.65f) || amp_f0_right > (amp_f0 * 0.65f)) continue;
 
-        // Фильтр хлопков / резких шумов
-        if (snr_mid > (snr_f0 * 0.60f)) continue; 
+        // Фильтр хлопков / резких шумов (расширен лимит под слабый сигнал)
+        if (snr_mid > (snr_f0 * 0.75f)) continue; 
 
-        // --- МЕТРИКА БАЛАНСА ЭНЕРГИИ ЛОПАСТЕЙ (БЛОКИРОВКА ВЕТРА) ---
-        // У реального дрона на частотах выше 400 Гц вторая гармоника (f1) обязана быть сильной.
-        // Если f0 превышает f1 более чем в 4.5 раза (как в вашем логе ветра 77.0 / 7.4 = 10.4), это 100% удар ветра!
-        if (f0 > 400.0f && (snr_f0 / (snr_f1 + 1e-6f) > 4.5f)) continue;
+        // Фильтр баланса энергии лопастей (смягчен до 7.0, так как f1 у вас идет тише)
+        if (f0 > 400.0f && (snr_f0 / (snr_f1 + 1e-6f) > 7.0f)) continue;
 
         // Фильтр аномальных наводок
-        if (snr_f0 > 80.0f && snr_f2 < 6.0f) continue;
+        if (snr_f0 > 80.0f && snr_f2 < 4.0f) continue;
 
-        // Основное спектральное сито
-        if (snr_f0 > current_threshold && snr_f1 > (current_threshold * 0.75f) && snr_f2 > 1.2f) {
+        // Спектральное сито: снизили требование к f1 до 0.55 от порога, так как в логе f1 слабее f2
+        if (snr_f0 > current_threshold && snr_f1 > (current_threshold * 0.55f) && snr_f2 > 1.0f) {
             float current_total_snr = snr_f0 + snr_f1 + snr_f2;
             if (current_total_snr > max_total_snr) {
                 max_total_snr = current_total_snr;
@@ -206,41 +199,43 @@ void loop() {
         }
     }
 
-    static int track_lifetime = 0; 
-
-    // 3. Интеграционный трекинг частоты (Ужесточенный коридор против ветра)
+    // 3. ИСПРАВЛЕННЫЙ ТРЕКИНГ ЧАСТОТЫ (БЕЗ ЖЕСТКОГО СБРОСА)
     if (drone_detected_this_frame) {
         if (tracked_f0 == 0.0f) {
+            // Первый захват
             tracked_f0 = best_f0;
-            track_lifetime = 15; // Сократили удержание до 15 кадров (~1 сек)
+            track_lifetime = 25; // Удерживаем частоту в памяти 25 кадров при пропусках (~1.6 сек)
             alarm_score += 2;
         } 
-        // СУЗИЛИ КОРИДОР ДО ±20 Гц: скачки ветра вроде 540 -> 515 (дельта 25) теперь разрушают трек
-        else if (abs(best_f0 - tracked_f0) <= 20.0f) {
+        else if (abs(best_f0 - tracked_f0) <= 30.0f) {
+            // Удержание трека в коридоре
             alarm_score += 2;
-            track_lifetime = 15; 
+            track_lifetime = 25; 
             tracked_f0 = (0.25f * best_f0) + (0.75f * tracked_f0); 
         } 
         else {
-            alarm_score -= 2; // Жесткий штраф за смену частоты
+            // Штраф за чужую частоту
+            alarm_score -= 1; 
         }
-    } else {
+    } 
+    else {
+        // Кадр пустой — плавно уменьшаем score, НО НЕ СТИРАЕМ tracked_f0 при score == 0!
         alarm_score -= 1; 
+        
         if (tracked_f0 > 0.0f) {
             track_lifetime--;
-            if (track_lifetime <= 0) tracked_f0 = 0.0f; 
+            if (track_lifetime <= 0) {
+                tracked_f0 = 0.0f; // Очищаем частоту ТОЛЬКО по таймауту жизни трека
+            }
         }
     }
 
-    // Защита от выхода Score за границы [0, ALARM_SCORE_MAX]
+    // Ограничители интегратора
     if (alarm_score < 0) alarm_score = 0;
     if (alarm_score > ALARM_SCORE_MAX) alarm_score = ALARM_SCORE_MAX;
 
-    // УВЕЛИЧИЛИ ПОРОГ ВЗВОДА ДО 6 (требуется минимум 3 стабильных кадра подряд)
-    int active_alarm_threshold = 6;
-
-    // Триггеры тревоги
-    if (!is_alarm && (alarm_score >= active_alarm_threshold)) {
+    // Решение по триггерам ALARM / CLEAR
+    if (!is_alarm && (alarm_score >= ALARM_SCORE_THRES)) {
         is_alarm = true;
         Serial.println("\n##################################################");
         Serial.printf("## ALARM: UAV DETECTED! Long-Track F0: %.1f Hz ##\n", tracked_f0);
@@ -264,14 +259,10 @@ void loop() {
                       processing_time, 
                       is_alarm ? "ALARM" : "IDLE", 
                       drone_detected_this_frame ? "YES" : "NO",
-                      alarm_score, active_alarm_threshold);
+                      alarm_score, ALARM_SCORE_THRES);
 
         if (drone_detected_this_frame) {
             Serial.printf(" | F0: %.1f Hz (Track: %.1f, Life: %d) | Total SNR: %.2f (f0:%.1f, f1:%.1f, f2:%.1f)", 
                           best_f0, tracked_f0, track_lifetime, max_total_snr, d_snr_f0, d_snr_f1, d_snr_f2);
         } else {
-            Serial.printf(" | Base Noise: %.6f | Track: %.1f", current_avg_noise, tracked_f0);
-        }
-        Serial.println();
-    }
-}
+Serial.printf(" | Base Noise: %.6f | Track: %.1f (Life: %d)", current_avg_noise, tracked_f0, track_lifetime);}Serial.println();}}
