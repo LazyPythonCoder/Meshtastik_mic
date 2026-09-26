@@ -21,7 +21,7 @@
 HardwareSerial EspSerial(2);
 
 // ID целевой ноды (c1e3b1c4) - сюда будут сыпаться все сообщения 
-const uint32_t TARGET_NODE_ID = 0xC1E3B1C4; 
+const uint32_t TARGET_NODE_ID = 0xA7EEF537; 
 
 #define I2S_BCLK_PIN GPIO_NUM_41
 #define I2S_WS_PIN   GPIO_NUM_42
@@ -150,7 +150,7 @@ void sendDirectMessage(const char* text, uint32_t targetId) {
   // Передаем готовый бинарный Protobuf-пакет в Serial-шину Heltec
   EspSerial.write(buffer, packet_length);
 
-  Serial.println("Бинарный DM пакет (ToRadio) успешно отправлен на ноду c1e3b1c4.");
+  Serial.println("Бинарный DM пакет (ToRadio) успешно отправлен на ноду a7eef537.");
 }
 
 void setup() {
